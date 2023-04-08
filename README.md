@@ -16,5 +16,8 @@ Python solutions for https://fly.io/dist-sys/
 
 ```shell
 # 3a
-./maelstrom/maelstrom test -w broadcast --bin ./03_broadcast/app_3a.py --node-count 1 --time-limit 20 --rate 10
+./maelstrom/maelstrom test -w broadcast --bin ./03_broadcast/app.py --node-count 1 --time-limit 20 --rate 10
+
+# 3b
+./maelstrom/maelstrom test -w broadcast --bin ./03_broadcast/app.py --node-count 5 --time-limit 20 --rate 10
 ```
