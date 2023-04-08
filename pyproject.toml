@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "dist-sys"
+version = "0.1.0"
+description = ""
+authors = ["Andrey Tatarinov <a@tatarinov.co>"]
+readme = "README.md"
+packages = [{include = "dist_sys"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pydantic = "^1.10.7"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
