@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import select
 import sys
 import time
-from typing import Annotated, Callable, Dict, Generator, Literal, Set, Union
+from typing import Annotated, Callable, Dict, Generator, Iterator, Literal, Set, Union
 from pydantic import BaseModel, Field
 
 
@@ -30,11 +30,20 @@ class Broadcast(BaseModel):
     msg_id: int
     message: int
 
-    original: bool = True
-
 
 class BroadcastOk(InReplyTo):
     type: Literal["broadcast_ok"] = "broadcast_ok"
+
+
+class BatchBroadcast(BaseModel):
+    type: Literal["batch_broadcast"] = "batch_broadcast"
+
+    msg_id: int
+    messages: list[int]
+
+
+class BatchBroadcastOk(InReplyTo):
+    type: Literal["batch_broadcast_ok"] = "batch_broadcast_ok"
 
 
 class Read(BaseModel):
@@ -65,6 +74,8 @@ Body = Annotated[
         InitOk,
         Broadcast,
         BroadcastOk,
+        BatchBroadcast,
+        BatchBroadcastOk,
         Read,
         ReadOk,
         Topology,
@@ -80,6 +91,10 @@ class Message(BaseModel):
     body: Body
 
 
+class Heartbeat(BaseModel):
+    pass
+
+
 @dataclass
 class PendingReply:
     msg: Message
@@ -90,7 +105,7 @@ class PendingReply:
 class Node:
     def __init__(self, node_id: str, node_ids: list[str]):
         self.node_id = node_id
-        self.node_ids = node_ids
+        self.node_ids = set(node_ids) - {node_id}
 
         self.known_messages: Set[int] = set()
 
@@ -100,15 +115,30 @@ class Node:
         # infinite generator of incrementally increasing message IDs
         self.message_id_gen = (i for i in range(1, sys.maxsize))
 
-    def heartbeat(self) -> None:
-        # check for pending replies that have timed out
-        for msg_id, pending_reply in self.pending_replies.items():
-            if time.time() - pending_reply.sent_at > 1:
-                sys.stderr.write(f"Reply timed out: {pending_reply.msg.json()}\n")
+        # Node ID -> Set of pending messages (ints)
+        self.pending_broadcasts: Dict[str, Set[int]] = {
+            node: set() for node in self.node_ids
+        }
 
-                # resend
-                sys.stderr.write(f"Resending: {pending_reply.msg.json()}\n")
-                self.send(pending_reply.msg, pending_reply.handler)
+    def heartbeat(self) -> None:
+        sys.stderr.write("Handle heartbeat\n")
+        # send batch broadcasts of pending messages
+        for node, messages in self.pending_broadcasts.items():
+            if messages:
+                self.send(
+                    Message(
+                        src=self.node_id,
+                        dest=node,
+                        body=BatchBroadcast(
+                            msg_id=next(self.message_id_gen),
+                            messages=list(messages),
+                        ),
+                    ),
+                    # clear messages that were sent on success
+                    lambda msg: self.pending_broadcasts[msg.dest].difference_update(
+                        msg.body.messages
+                    ),
+                )
 
     def send(
         self,
@@ -154,8 +184,13 @@ class Node:
                         body=TopologyOk(in_reply_to=msg_id),
                     )
                 )
-            case Broadcast(msg_id=msg_id, message=message, original=original):
+            case Broadcast(msg_id=msg_id, message=message):
                 self.known_messages.add(message)
+
+                # add message to pending broadcasts
+                for node in self.node_ids:
+                    self.pending_broadcasts[node].add(message)
+
                 self.send(
                     Message(
                         src=msg.dest,
@@ -163,22 +198,6 @@ class Node:
                         body=BroadcastOk(in_reply_to=msg_id),
                     )
                 )
-
-                if original:
-                    for node in self.node_ids:
-                        if node != self.node_id:
-                            self.send(
-                                Message(
-                                    src=self.node_id,
-                                    dest=node,
-                                    body=Broadcast(
-                                        msg_id=next(self.message_id_gen),
-                                        message=message,
-                                        original=False,
-                                    ),
-                                ),
-                                lambda msg: None,
-                            )
             case Read(msg_id=msg_id):
                 self.send(
                     Message(
@@ -189,20 +208,32 @@ class Node:
                         ),
                     )
                 )
+            case BatchBroadcast(msg_id=msg_id, messages=messages):
+                self.known_messages.update(messages)
+                self.send(
+                    Message(
+                        src=msg.dest,
+                        dest=msg.src,
+                        body=BatchBroadcastOk(in_reply_to=msg_id),
+                    )
+                )
 
 
-def read_message_or_timeout(
+def read_message_with_heartbeat(
     timeout: float,
-) -> Message | None:
+) -> Iterator[Message | Heartbeat]:
     """Read a line from stdin with a timeout."""
     start = time.time()
     while True:
         if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
             line = sys.stdin.readline()
             if line:
-                return Message.parse_raw(line)
+                msg = Message.parse_raw(line)
+                sys.stderr.write(f"Received: {msg.json()}\n")
+                yield msg
         if time.time() - start > timeout:
-            return None
+            yield Heartbeat()
+            start = time.time()
 
         time.sleep(0.01)
 
@@ -210,8 +241,8 @@ def read_message_or_timeout(
 def main():
     sys.stderr.write("Starting app\n")
 
-    # receive init message
-    init_message = read_message_or_timeout(1)
+    line = sys.stdin.readline()
+    init_message = Message.parse_raw(line)
     assert init_message is not None
     sys.stderr.write(f"Received: {init_message.json()}\n")
     assert isinstance(init_message.body, Init)
@@ -226,17 +257,19 @@ def main():
     sys.stdout.write(f"{res.json()}\n")
     sys.stdout.flush()
 
+    input = read_message_with_heartbeat(0.5)
+
     # init node
     node = Node(init_message.body.node_id, init_message.body.node_ids)
 
     # loop over messages, process them and send responses
     while True:
-        msg = read_message_or_timeout(1)
-        if msg is not None:
-            sys.stderr.write(f"Received: {msg.json()}\n")
-            node.handle(msg)
-        else:
-            node.heartbeat()
+        msg = next(input)
+        match msg:
+            case Heartbeat():
+                node.heartbeat()
+            case Message():
+                node.handle(msg)
 
 
 if __name__ == "__main__":
