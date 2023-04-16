@@ -4,7 +4,7 @@ version = "0.1.0"
 description = ""
 authors = ["Andrey Tatarinov <a@tatarinov.co>"]
 readme = "README.md"
-packages = [{include = "dist_sys"}]
+packages = [{include = "mstrm"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"

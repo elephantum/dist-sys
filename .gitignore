@@ -1,3 +1,5 @@
 venv/
 maelstrom/
 store/
+__pycache__/
+*.pyc
